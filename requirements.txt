@@ -1,0 +1,15 @@
+# Runtime dependencies for the DJI Frame Extractor.
+#
+# NOTE: the Windows CUDA build (cuda_build/) deliberately uses a *locally
+# built* CUDA-enabled OpenCV instead of the PyPI wheel below -- the PyPI
+# opencv-python wheel is CPU-only. Do NOT `pip install --upgrade
+# opencv-python` into the CUDA build's interpreter or it will shadow the
+# CUDA cv2.
+
+opencv-python>=4.5     # adaptive mode only (CPU wheel from PyPI)
+numpy
+piexif                 # EXIF (camera + GPS + focal length)
+PySide6>=6.5           # desktop GUI
+
+# External, not pip-installable -- must be on PATH:
+#   ffmpeg, ffprobe    (decode / frame extraction / probing; untile needs >= 4.4)

@@ -1,0 +1,168 @@
+name: Release builds
+
+# Build CPU Win/Mac/Linux executables when a tag like v1.2.3 is pushed, and
+# attach them to the matching GitHub Release.
+#
+# NOTE: the GPU-accelerated Windows CUDA build is produced LOCALLY
+# (cuda_build/) -- CI runners have no NVIDIA GPU and CUDA OpenCV is not on
+# PyPI -- so these CI artifacts are CPU-only by design.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to upload release assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.os_label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            os_label: windows-x64
+            asset_name: extract-frames-windows-x64.zip
+          - runner: macos-14 # Apple Silicon
+            os_label: macos-arm64
+            asset_name: extract-frames-macos-arm64
+          - runner: ubuntu-22.04
+            os_label: linux-x86_64
+            asset_name: extract-frames-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PySide6 opencv-python numpy piexif
+
+      - name: Import smoke test (no GUI)
+        shell: bash
+        run: python -c "import src.core.pipeline, src.cli; print('imports OK')"
+
+      # ----- Fetch ffmpeg / ffprobe into cross_build/bin/ -----
+
+      - name: Fetch deps (Windows)
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol =
+              [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+          $bin = "cross_build\bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $ffZip = "$env:TEMP\ffmpeg.zip"
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+                            -OutFile $ffZip -UseBasicParsing
+          Expand-Archive -Force $ffZip "$env:TEMP\ffmpeg-x"
+          $ffmpegExe  = Get-ChildItem "$env:TEMP\ffmpeg-x" -Recurse -Filter ffmpeg.exe  | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem "$env:TEMP\ffmpeg-x" -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          Copy-Item -Force $ffmpegExe.FullName  "$bin\ffmpeg.exe"
+          Copy-Item -Force $ffprobeExe.FullName "$bin\ffprobe.exe"
+          Get-ChildItem $bin
+
+      - name: Fetch deps (macOS)
+        if: matrix.runner == 'macos-14'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p cross_build/bin
+          brew install ffmpeg
+          cp -L "$(command -v ffmpeg)"   cross_build/bin/ffmpeg
+          cp -L "$(command -v ffprobe)"  cross_build/bin/ffprobe
+          chmod +x cross_build/bin/*
+          ls -l cross_build/bin/
+
+      - name: Fetch deps (Linux)
+        if: matrix.runner == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p cross_build/bin
+          curl -fsSL --retry 3 --retry-delay 5 \
+              https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+              -o /tmp/ffmpeg.tar.xz
+          mkdir -p /tmp/ffx && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffx --strip-components=1
+          cp /tmp/ffx/bin/ffmpeg  cross_build/bin/ffmpeg
+          cp /tmp/ffx/bin/ffprobe cross_build/bin/ffprobe
+          chmod +x cross_build/bin/* || true
+          ls -l cross_build/bin/
+
+      # ----- Build with PyInstaller -----
+
+      - name: Run PyInstaller
+        shell: bash
+        working-directory: cross_build
+        run: |
+          python -m PyInstaller build.spec --clean --noconfirm
+          ls -l dist/
+
+      # ----- Stage + upload -----
+
+      - name: "Stage asset (Windows -- zip the onedir folder)"
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "cross_build\dist\extract-frames"
+          $dst = "cross_build\dist\${{ matrix.asset_name }}"
+          if (-not (Test-Path $src)) { throw "Expected onedir folder $src not found" }
+          Compress-Archive -Path $src -DestinationPath $dst -Force
+          Get-Item $dst | Format-List Name, Length
+
+      - name: "Stage asset (Mac/Linux -- rename single binary)"
+        if: matrix.runner != 'windows-latest'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          src="cross_build/dist/extract-frames"
+          dst="cross_build/dist/${{ matrix.asset_name }}"
+          mv "$src" "$dst"
+          ls -lh "$dst"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: cross_build/dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p release-files
+          find artifacts -type f -exec cp -v {} release-files/ \;
+          ls -l release-files/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-files/*
