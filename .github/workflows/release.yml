@@ -11,7 +11,12 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the built binaries to"
+        required: true
+        default: "v1.0.0"
 
 permissions:
   contents: write # needed to upload release assets
@@ -132,37 +137,14 @@ jobs:
           mv "$src" "$dst"
           ls -lh "$dst"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset_name }}
-          path: cross_build/dist/${{ matrix.asset_name }}
-          if-no-files-found: error
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Flatten artifacts
-        run: |
-          set -euxo pipefail
-          mkdir -p release-files
-          find artifacts -type f -exec cp -v {} release-files/ \;
-          ls -l release-files/
-
-      - name: Create / update GitHub Release
+      # Attach each binary straight to the GitHub Release (tags only).
+      # Releases do NOT consume the Actions artifact-storage quota, so this
+      # avoids the "Artifact storage quota has been hit" failure that
+      # upload-artifact/download-artifact hits on a full account.
+      - name: Attach asset to Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          files: release-files/*
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          files: cross_build/dist/${{ matrix.asset_name }}
+          fail_on_unmatched_files: true
